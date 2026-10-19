@@ -30,10 +30,13 @@ use soroban_sdk::{
 };
 
 const MIN_DELAY_LEDGERS: u32 = 17_280;
+const MAX_DELAY_LEDGERS: u32 = 52_560_000; // ~10 years at 5 s/ledger
 // ~14 days at 5 s/ledger (14 * 24 * 60 * 60 / 5 = 241_920).
 // A pending change that is not applied within this window after its
 // execute_after ledger is considered stale and must be re-scheduled.
 const GRACE_PERIOD_LEDGERS: u32 = 241_920;
+const MAX_PARAM_LEN: usize = 256;
+const MAX_VALUE_LEN: usize = 4096;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -131,7 +134,8 @@ impl AdminTimelockContract {
     }
 
     /// Queue a parameter change. Returns the change_id.
-    /// delay_ledgers must be at least MIN_DELAY_LEDGERS (~24 hours at 5 s/ledger).
+    /// delay_ledgers must be at least MIN_DELAY_LEDGERS (~24 hours at 5 s/ledger)
+    /// and at most MAX_DELAY_LEDGERS (~10 years at 5 s/ledger).
     pub fn schedule_change(
         env: Env,
         caller: Address,
@@ -142,8 +146,25 @@ impl AdminTimelockContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
+        // Validate param string (issue #86: prevent empty or unbounded strings)
+        if param.len() == 0 {
+            panic!("param must not be empty");
+        }
+        if param.len() > MAX_PARAM_LEN {
+            panic!("param exceeds maximum length");
+        }
+
+        // Validate value string (issue #86: prevent unbounded strings)
+        if value.len() > MAX_VALUE_LEN {
+            panic!("value exceeds maximum length");
+        }
+
+        // Validate delay range (issue #85: prevent astronomical timelock lockouts)
         if delay_ledgers < MIN_DELAY_LEDGERS {
             panic!("delay_ledgers must be >= 17280 (24 h)");
+        }
+        if delay_ledgers > MAX_DELAY_LEDGERS {
+            panic!("delay_ledgers must be <= 52560000 (~10 years)");
         }
 
         let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap();

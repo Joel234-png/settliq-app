@@ -4,7 +4,7 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Merchant } from '../../merchants/entities/merchant.entity';
+import { Merchant, MerchantStatus } from '../../merchants/entities/merchant.entity';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -27,6 +27,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   async validate(payload: { sub: string; email: string; role: string }) {
     const merchant = await this.merchantsRepo.findOne({ where: { id: payload.sub } });
     if (!merchant) throw new UnauthorizedException('Merchant not found');
+
+    // Verify merchant is active (issue #87: prevent suspended merchants from using tokens)
+    if (merchant.status !== MerchantStatus.ACTIVE) {
+      throw new UnauthorizedException(`Merchant account is ${merchant.status} and cannot access the API`);
+    }
+
     return { merchantId: merchant.id, email: merchant.email, role: merchant.role };
   }
 }

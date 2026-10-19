@@ -32,7 +32,9 @@ fi
 
 if [[ ! -f "${WASM_PATH}" ]]; then
   echo "Escrow WASM not found at ${WASM_PATH}. Building..."
-  cargo wasm-build --manifest-path "${CONTRACTS_ROOT}/contracts/payment_escrow/Cargo.toml"
+  # Build the Soroban contract to WebAssembly (issue #88: fixed cargo command)
+  cargo build --manifest-path "${CONTRACTS_ROOT}/contracts/payment_escrow/Cargo.toml" \
+    --target wasm32v1-none --release
 fi
 
 echo "Deploying escrow contract to ${NETWORK}..."
@@ -58,7 +60,8 @@ update_env_key() {
 
   touch "${file}"
 
-  if rg "^${key}=" "${file}" >/dev/null 2>&1; then
+  # Use grep instead of rg for portability (issue #88: removed ripgrep dependency)
+  if grep -q "^${key}=" "${file}"; then
     sed -i.bak "s|^${key}=.*|${key}=${value}|" "${file}"
   else
     printf '\n%s=%s\n' "${key}" "${value}" >> "${file}"
