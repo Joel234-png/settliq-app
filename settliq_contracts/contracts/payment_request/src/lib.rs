@@ -117,6 +117,11 @@ impl PaymentRequestContract {
         if amount <= 0 {
             panic!("amount must be > 0");
         }
+        // Validate asset token address is not the contract itself (#82)
+        let contract_addr = env.current_contract_address();
+        if asset == contract_addr {
+            panic!("asset cannot be the contract address");
+        }
         let key = DataKey::Payment(id.clone());
         if env.storage().persistent().has(&key) {
             panic!("Payment already exists");
@@ -228,8 +233,11 @@ impl PaymentRequestContract {
         let key = DataKey::Payment(id.clone());
         let mut payment = load_payment(&env, &key);
 
-        if payment.status == PaymentStatus::Settled || payment.status == PaymentStatus::Expired {
-            panic!("Cannot fail a finalized payment");
+        // Prevent failing during in-flight fiat payout (#81)
+        if payment.status == PaymentStatus::Settled ||
+           payment.status == PaymentStatus::Expired ||
+           payment.status == PaymentStatus::Settling {
+            panic!("Cannot fail a finalized or in-flight payment");
         }
 
         payment.status = PaymentStatus::Failed;
