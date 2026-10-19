@@ -321,6 +321,21 @@ impl StellarConfirmationsContract {
             .unwrap_or(false)
     }
 
+    /// Returns the current admin address (issue #73).
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"))
+    }
+
+    /// Transfers admin privileges to a new address (issue #73).
+    pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(caller == &admin, "not admin");
