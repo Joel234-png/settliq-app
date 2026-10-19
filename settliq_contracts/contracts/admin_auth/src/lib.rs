@@ -298,6 +298,12 @@ impl AdminAuthContract {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| panic!("admin not found"));
+
+        // Check idempotency: only emit event and persist if actually changing state (#84)
+        if !user.active {
+            return;
+        }
+
         user.active = false;
         Self::save(&env, user);
         env.events().publish(
@@ -361,7 +367,8 @@ impl AdminAuthContract {
             .get(&DataKey::AdminCount)
             .unwrap_or(0);
         let start = offset.min(count);
-        let end = (start + page_size).min(count);
+        // Saturate addition to prevent overflow panic (#83)
+        let end = start.saturating_add(page_size).min(count);
         let mut page: Vec<Address> = Vec::new(&env);
         for i in start..end {
             if let Some(addr) = env
