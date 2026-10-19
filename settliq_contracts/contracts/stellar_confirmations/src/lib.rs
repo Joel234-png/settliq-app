@@ -49,18 +49,28 @@ pub trait PaymentEscrowInterface {
     fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrowRecord;
 }
 
+// ── payment state consolidation (issue #74) ────────────────────────────────
+
+/// Consolidated payment confirmation state (issue #74).
+/// Combines 6 separate keys per payment into a single struct to reduce storage bloat.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaymentConfirmationState {
+    pub confs: u32,              // confirmed count so far for a payment
+    pub first_ledger: u32,       // ledger_seq of the first confirmation
+    pub last_ledger: u32,        // ledger_seq of the most recent confirmation
+    pub required_confs: u32,     // required count snapshotted at first confirmation
+    pub settling: bool,          // already transitioned to settling state
+    pub failed: bool,            // terminal failure state
+}
+
 // ── storage keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
 enum DataKey {
     Admin,
     ConfirmationCount,          // required ledger-close count (u32)
-    PaymentConfs(BytesN<32>),   // confirmed count so far for a payment (u32)
-    PaymentFirstLedger(BytesN<32>), // ledger_seq of the first confirmation
-    PaymentLastLedger(BytesN<32>),  // ledger_seq of the most recent confirmation
-    PaymentRequiredConfs(BytesN<32>), // required count snapshotted at first confirmation
-    PaymentSettling(BytesN<32>),    // bool — already transitioned
-    PaymentFailed(BytesN<32>),      // bool — terminal failure state
+    PaymentState(BytesN<32>),   // consolidated PaymentConfirmationState (issue #74)
     PaymentEscrowContract,      // optional Address of the payment_escrow contract
 }
 // ── events ───────────────────────────────────────────────────────────────────
@@ -141,56 +151,50 @@ impl StellarConfirmationsContract {
         // Guard: ledger_seq must not be in the future relative to the actual chain state
         assert!(ledger_seq <= env.ledger().sequence(), "ledger_seq exceeds current ledger");
 
+        // Load consolidated payment state (issue #74)
+        let mut state = Self::load_payment_state(&env, &payment_id);
+
         // Guard: ledger_seq must be strictly greater than the last one recorded
         // for this payment. Allowing ledger_seq == last_seen would permit multiple
         // confirmations within the same ledger, enabling artificial inflation of
         // the confirmation counter to the threshold in a single ledger block and
         // invalidating the multi-ledger confirmation requirement.
-        let last_key = DataKey::PaymentLastLedger(payment_id.clone());
-        if let Some(last_seen) = env.storage().persistent().get::<_, u32>(&last_key) {
-            assert!(ledger_seq > last_seen, "ledger_seq must exceed last recorded ledger");
+        if state.last_ledger > 0 {
+            assert!(ledger_seq > state.last_ledger, "ledger_seq must exceed last recorded ledger");
         }
 
         // Guard: already settling — idempotent no-op after threshold
-        let settling_key = DataKey::PaymentSettling(payment_id.clone());
-        if env.storage().persistent().get::<_, bool>(&settling_key).unwrap_or(false) {
-            panic!("payment already settling");
-        }
+        assert!(!state.settling, "payment already settling");
 
         // Guard: already failed — terminal state, cannot resume confirming
-        let failed_key = DataKey::PaymentFailed(payment_id.clone());
-        if env.storage().persistent().get::<_, bool>(&failed_key).unwrap_or(false) {
-            panic!("payment already failed");
-        }
+        assert!(!state.failed, "payment already failed");
 
         // Increment confirmation counter
-        let confs_key = DataKey::PaymentConfs(payment_id.clone());
-        let confs: u32 = env.storage().persistent().get(&confs_key).unwrap_or(0);
-        let new_confs = confs.checked_add(1).expect("overflow");
-        env.storage().persistent().set(&confs_key, &new_confs);
+        let new_confs = state.confs.checked_add(1).expect("overflow");
 
-        // Record first-seen ledger for auditability
-        let first_key = DataKey::PaymentFirstLedger(payment_id.clone());
-        if !env.storage().persistent().has(&first_key) {
-            env.storage().persistent().set(&first_key, &ledger_seq);
+        // Record first-seen ledger for auditability (only on first confirmation)
+        if state.first_ledger == 0 {
+            state.first_ledger = ledger_seq;
         }
 
         // Record last-seen ledger for the monotonicity check above
-        env.storage().persistent().set(&last_key, &ledger_seq);
+        state.last_ledger = ledger_seq;
+        state.confs = new_confs;
 
         // Snapshot the required confirmation count at first confirmation so
         // later admin changes to the global ConfirmationCount don't retroactively
         // move the threshold for payments already accumulating confirmations.
-        let required_key = DataKey::PaymentRequiredConfs(payment_id.clone());
-        let required: u32 = match env.storage().persistent().get(&required_key) {
-            Some(snapshotted) => snapshotted,
-            None => {
-                let current: u32 =
-                    env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
-                env.storage().persistent().set(&required_key, &current);
-                current
-            }
+        let required: u32 = if state.required_confs == 0 {
+            let current: u32 =
+                env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
+            state.required_confs = current;
+            current
+        } else {
+            state.required_confs
         };
+
+        // Save consolidated payment state (issue #74)
+        Self::save_payment_state(&env, &payment_id, &state);
 
         env.events().publish(
             ("STELLAR_CONFS", "confirmation_recorded"),
@@ -214,7 +218,8 @@ impl StellarConfirmationsContract {
                 assert!(payment.merchant == merchant, "merchant mismatch with payment_escrow");
             }
 
-            env.storage().persistent().set(&settling_key, &true);
+            state.settling = true;
+            Self::save_payment_state(&env, &payment_id, &state);
 
             env.events().publish(
                 ("STELLAR_CONFS", "settlement_authorised"),
@@ -238,33 +243,30 @@ impl StellarConfirmationsContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
+        // Load consolidated payment state (issue #74)
+        let mut state = Self::load_payment_state(&env, &payment_id);
+
         // Guard: cannot fail a payment that has already crossed the
         // threshold and is settling — that path is final.
-        let settling_key = DataKey::PaymentSettling(payment_id.clone());
-        if env.storage().persistent().get::<_, bool>(&settling_key).unwrap_or(false) {
-            panic!("payment already settling");
-        }
+        assert!(!state.settling, "payment already settling");
 
         // Guard: idempotent — cannot fail an already-failed payment.
-        let failed_key = DataKey::PaymentFailed(payment_id.clone());
-        if env.storage().persistent().get::<_, bool>(&failed_key).unwrap_or(false) {
-            panic!("payment already failed");
-        }
+        assert!(!state.failed, "payment already failed");
 
-        env.storage().persistent().set(&failed_key, &true);
+        state.failed = true;
+        Self::save_payment_state(&env, &payment_id, &state);
 
-        let confs: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PaymentConfs(payment_id.clone()))
-            .unwrap_or(0);
-        let required: u32 = env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
+        let required: u32 = if state.required_confs > 0 {
+            state.required_confs
+        } else {
+            env.storage().instance().get(&DataKey::ConfirmationCount).unwrap()
+        };
 
         env.events().publish(
             ("STELLAR_CONFS", "confirmation_failed"),
             ConfirmationFailedEvent {
                 payment_id,
-                confirmations: confs,
+                confirmations: state.confs,
                 required,
             },
         );
@@ -301,24 +303,15 @@ impl StellarConfirmationsContract {
     }
 
     pub fn get_payment_confirmations(env: Env, payment_id: BytesN<32>) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentConfs(payment_id))
-            .unwrap_or(0)
+        Self::load_payment_state(&env, &payment_id).confs
     }
 
     pub fn is_settling(env: Env, payment_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentSettling(payment_id))
-            .unwrap_or(false)
+        Self::load_payment_state(&env, &payment_id).settling
     }
 
     pub fn is_failed(env: Env, payment_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentFailed(payment_id))
-            .unwrap_or(false)
+        Self::load_payment_state(&env, &payment_id).failed
     }
 
     /// Returns the current admin address (issue #73).
@@ -334,6 +327,30 @@ impl StellarConfirmationsContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
+    // ── Payment state consolidation helpers (issue #74) ──────────────────────
+
+    /// Load consolidated payment state, defaulting to empty state if not found.
+    fn load_payment_state(env: &Env, payment_id: &BytesN<32>) -> PaymentConfirmationState {
+        env.storage()
+            .persistent()
+            .get::<_, PaymentConfirmationState>(&DataKey::PaymentState(payment_id.clone()))
+            .unwrap_or(PaymentConfirmationState {
+                confs: 0,
+                first_ledger: 0,
+                last_ledger: 0,
+                required_confs: 0,
+                settling: false,
+                failed: false,
+            })
+    }
+
+    /// Save consolidated payment state.
+    fn save_payment_state(env: &Env, payment_id: &BytesN<32>, state: &PaymentConfirmationState) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentState(payment_id.clone()), state);
     }
 
     fn require_admin(env: &Env, caller: &Address) {
