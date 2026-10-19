@@ -109,6 +109,16 @@ impl SettlementLedgerContract {
         assert!(net >= 0, "net must be >= 0");
         assert!(fee + net == amount, "fee + net must equal amount");
 
+        // Validate timestamp is reasonable (issue #75)
+        let current_time = env.ledger().timestamp();
+        assert!(timestamp > 0, "timestamp must not be zero");
+        assert!(timestamp <= current_time, "timestamp must not be in the future");
+        // Allow timestamps up to 90 days in the past for backdated settlements
+        assert!(
+            timestamp + (90 * 24 * 60 * 60) >= current_time,
+            "timestamp too far in the past (> 90 days)"
+        );
+
         let key = DataKey::Settlement(payment_id.clone());
         assert!(!env.storage().persistent().has(&key), "settlement already recorded");
 
@@ -191,6 +201,11 @@ impl SettlementLedgerContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         assert!(env.storage().persistent().has(&DataKey::Settlement(payment_id.clone())), "settlement not found");
+
+        // Validate reason parameter (issue #76)
+        assert!(reason.len() > 0, "reason must not be empty");
+        assert!(reason.len() <= 256, "reason must not exceed 256 characters");
+
         let key = DataKey::Void(payment_id.clone());
         assert!(!env.storage().persistent().has(&key), "settlement already voided");
         env.storage().persistent().set(&key, &SettlementVoid { payment_id, reason, voided_at: env.ledger().timestamp() });
