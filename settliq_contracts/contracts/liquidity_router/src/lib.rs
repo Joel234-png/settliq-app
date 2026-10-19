@@ -91,21 +91,24 @@ impl LiquidityRouter {
         let mut pools: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedPools)
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Prevent duplicates
-        if !pools.iter().any(|p| p == pool) {
-            // Issue #1082: Enforce a maximum allowlist size before inserting
-            if pools.len() >= MAX_POOLS {
-                panic!("max pools reached");
-            }
-            pools.push_back(pool.clone());
-            env.storage().instance().set(&DataKey::ApprovedPools, &pools);
-
-            // Issue #1083: Emit event for the allowlist change
-            env.events().publish(
-                (Symbol::new(&env, "PoolAddedEvent"),),
-                PoolAddedEvent { pool_id: pool },
-            );
+        // Check for duplicates (issue #71 - fail instead of silently succeeding)
+        if pools.iter().any(|p| p == pool) {
+            panic!("pool is already allowlisted");
         }
+
+        // Issue #1082: Enforce a maximum allowlist size before inserting
+        if pools.len() >= MAX_POOLS {
+            panic!("max pools reached");
+        }
+
+        pools.push_back(pool.clone());
+        env.storage().instance().set(&DataKey::ApprovedPools, &pools);
+
+        // Issue #1083: Emit event for the allowlist change
+        env.events().publish(
+            (Symbol::new(&env, "PoolAddedEvent"),),
+            PoolAddedEvent { pool_id: pool },
+        );
     }
 
     // Issue #1025: Remove pool from allowlist (admin-gated)
@@ -166,6 +169,35 @@ impl LiquidityRouter {
             .instance()
             .get(&DataKey::DepthThresholdBps)
             .unwrap_or(DEFAULT_DEPTH_THRESHOLD_BPS)
+    }
+
+    /// Returns the current admin address (issue #70)
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set")
+    }
+
+    /// Transfers admin privileges to a new address (issue #70)
+    pub fn transfer_admin(env: Env, current_admin: Address, new_admin: Address) {
+        current_admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("admin not set");
+        if current_admin != stored_admin {
+            panic!("only admin can transfer admin");
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
+    /// Returns the list of approved pools (issue #69)
+    pub fn get_approved_pools(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedPools)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Checks if the AMM pool has sufficient depth for a swap.

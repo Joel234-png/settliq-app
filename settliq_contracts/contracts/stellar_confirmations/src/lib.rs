@@ -47,6 +47,7 @@ pub struct PaymentEscrowRecord {
 #[contractclient(name = "PaymentEscrowClient")]
 pub trait PaymentEscrowInterface {
     fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrowRecord;
+    fn release(env: Env, payment_id: BytesN<32>);
 }
 
 // ── payment state consolidation (issue #74) ────────────────────────────────
@@ -216,6 +217,8 @@ impl StellarConfirmationsContract {
                 let payment = escrow_client.get_payment(&payment_id);
                 assert!(payment.amount == amount, "amount mismatch with payment_escrow");
                 assert!(payment.merchant == merchant, "merchant mismatch with payment_escrow");
+                // Automatically release the payment on the escrow contract
+                escrow_client.release(&payment_id);
             }
 
             state.settling = true;
